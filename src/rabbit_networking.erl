@@ -28,8 +28,7 @@
 -export([tcp_listener_addresses/1, tcp_listener_spec/6,
          ensure_ssl/0, fix_ssl_options/1, poodle_check/1, ssl_transform_fun/1]).
 
--export([tcp_listener_started/3, tcp_listener_stopped/3,
-         start_client/1, start_ssl_client/2]).
+-export([tcp_listener_started/3, tcp_listener_stopped/3]).
 
 %% Internal
 -export([connections_local/0]).
@@ -99,12 +98,6 @@
                 -> rabbit_types:ok_or_error(#ssl_socket{}))).
 
 -spec(boot/0 :: () -> 'ok').
--spec(start_client/1 ::
-	(port() | #ssl_socket{ssl::{'sslsocket',_,_}}) ->
-			     atom() | pid() | port() | {atom(),atom()}).
--spec(start_ssl_client/2 ::
-	(_,port() | #ssl_socket{ssl::{'sslsocket',_,_}}) ->
-				 atom() | pid() | port() | {atom(),atom()}).
 -spec(tcp_listener_started/3 ::
 	(_,
          string() |
@@ -126,6 +119,7 @@
 
 boot() ->
     ok = record_distribution_listener(),
+    ok = application:start(ranch),
     ok = start(),
     ok = boot_tcp(),
     ok = boot_ssl().
@@ -282,6 +276,12 @@ ssl_transform_fun(SslOpts) ->
                 {error, timeout} ->
                     {error, {ssl_upgrade_error, timeout}};
                 {error, Reason} ->
+
+%% @todo OK this bit is interesting, and would be interesting to
+%% add to Ranch. However we might want something more useful than
+%% a simple timer:sleep/1, surely we can monitor the SSL process
+%% and not wait too long before returning.
+
                     %% We have no idea what state the ssl_connection
                     %% process is in - it could still be happily
                     %% going, it might be stuck, or it could be just
@@ -320,9 +320,13 @@ tcp_listener_addresses_auto(Port) ->
 
 tcp_listener_spec(NamePrefix, {IPAddress, Port, Family}, SocketOpts,
                   Protocol, Label, OnConnect) ->
+    Transport = case Protocol of
+        amqp -> ranch_tcp;
+        'amqp/ssl' -> ranch_ssl
+    end,
     {rabbit_misc:tcp_name(NamePrefix, IPAddress, Port),
      {tcp_listener_sup, start_link,
-      [IPAddress, Port, [Family | SocketOpts],
+      [IPAddress, Port, Transport, [Family | SocketOpts],
        {?MODULE, tcp_listener_started, [Protocol]},
        {?MODULE, tcp_listener_stopped, [Protocol]},
        OnConnect, Label]},
@@ -399,28 +403,6 @@ on_node_down(Node) ->
         true  -> rabbit_log:info(
                    "Keep ~s listeners: the node is already back~n", [Node])
     end.
-
-start_client(Sock, SockTransform) ->
-    {ok, _Child, Reader} = supervisor:start_child(rabbit_tcp_client_sup, []),
-    ok = rabbit_net:controlling_process(Sock, Reader),
-    Reader ! {go, Sock, SockTransform},
-
-    %% In the event that somebody floods us with connections, the
-    %% reader processes can spew log events at error_logger faster
-    %% than it can keep up, causing its mailbox to grow unbounded
-    %% until we eat all the memory available and crash. So here is a
-    %% meaningless synchronous call to the underlying gen_event
-    %% mechanism. When it returns the mailbox is drained, and we
-    %% return to our caller to accept more connetions.
-    gen_event:which_handlers(error_logger),
-
-    Reader.
-
-start_client(Sock) ->
-    start_client(Sock, fun (S) -> {ok, S} end).
-
-start_ssl_client(SslOpts, Sock) ->
-    start_client(Sock, ssl_transform_fun(SslOpts)).
 
 register_connection(Pid) -> pg_local:join(rabbit_connections, Pid).
 

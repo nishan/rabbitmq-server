@@ -52,12 +52,20 @@ start_link() ->
           SupPid,
           {helper_sup, {rabbit_connection_helper_sup, start_link, []},
            intrinsic, infinity, supervisor, [rabbit_connection_helper_sup]}),
-    {ok, ReaderPid} =
-        supervisor2:start_child(
-          SupPid,
-          {reader, {rabbit_reader, start_link, [HelperSup]},
-           intrinsic, ?MAX_WAIT, worker, [rabbit_reader]}),
-    {ok, SupPid, ReaderPid}.
+
+%% @todo Should be no need for helper_sup anymore, however connection_sup
+%% will need to be linked to the connection process to behave similarly.
+%% Actually might be better to just start helper_sup instead of connection_sup...
+
+%% @todo Note that we need to replace rabbit_connection_helper_sup in other
+%% places of the code, like the rabbit_reader module.
+
+%    {ok, ReaderPid} =
+%        supervisor2:start_child(
+%          SupPid,
+%          {reader, {rabbit_reader, start_link, [HelperSup]},
+%           intrinsic, ?MAX_WAIT, worker, [rabbit_reader]}),
+    {ok, SupPid, HelperSup}.
 
 reader(Pid) ->
     hd(supervisor2:find_child(Pid, reader)).

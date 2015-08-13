@@ -15,6 +15,7 @@
 %%
 
 -module(rabbit_reader).
+-behaviour(ranch_protocol).
 
 %% This is an AMQP 0-9-1 connection implementation. If AMQP 1.0 plugin is enabled,
 %% this module passes control of incoming AMQP 1.0 connections to it.
@@ -53,12 +54,12 @@
 -include("rabbit_framing.hrl").
 -include("rabbit.hrl").
 
--export([start_link/1, info_keys/0, info/1, info/2, force_event_refresh/2,
+-export([start_link/4, info_keys/0, info/1, info/2, force_event_refresh/2,
          shutdown/2]).
 
 -export([system_continue/3, system_terminate/4, system_code_change/4]).
 
--export([init/2, mainloop/4, recvloop/4]).
+-export([init/4, mainloop/4, recvloop/4]).
 
 -export([conserve_resources/3, server_properties/1]).
 
@@ -182,7 +183,7 @@
 
 -ifdef(use_specs).
 
--spec(start_link/1 :: (pid()) -> rabbit_types:ok(pid())).
+-spec(start_link/4 :: (any(), rabbit_net:socket(), module(), any()) -> rabbit_types:ok(pid())).
 -spec(info_keys/0 :: () -> rabbit_types:info_keys()).
 -spec(info/1 :: (pid()) -> rabbit_types:infos()).
 -spec(info/2 :: (pid(), rabbit_types:info_keys()) -> rabbit_types:infos()).
@@ -193,12 +194,10 @@
                                   rabbit_framing:amqp_table()).
 
 %% These specs only exists to add no_return() to keep dialyzer happy
--spec(init/2 :: (pid(), pid()) -> no_return()).
--spec(start_connection/5 ::
-        (pid(), pid(), any(), rabbit_net:socket(),
-         fun ((rabbit_net:socket()) ->
-                     rabbit_types:ok_or_error2(
-                       rabbit_net:socket(), any()))) -> no_return()).
+-spec(init/4 :: (pid(), pid(), any(), rabbit_net:socket()) -> no_return()).
+-spec(start_connection/4 ::
+        (pid(), pid(), any(), rabbit_net:socket()
+                       ) -> no_return()).
 
 -spec(mainloop/4 :: (_,[binary()], non_neg_integer(), #v1{}) -> any()).
 -spec(system_code_change/4 :: (_,_,_,_) -> {'ok',_}).
@@ -210,18 +209,20 @@
 
 %%--------------------------------------------------------------------------
 
-start_link(HelperSup) ->
-    {ok, proc_lib:spawn_link(?MODULE, init, [self(), HelperSup])}.
+start_link(Ref, Sock, _Transport, _Opts) ->
+    {ok, _Child, HelperSup} = supervisor:start_child(rabbit_tcp_client_sup, []),
+
+%% @todo Start the helper_sup here.
+
+    {ok, proc_lib:spawn_link(?MODULE, init, [self(), HelperSup, Ref, Sock])}.
 
 shutdown(Pid, Explanation) ->
     gen_server:call(Pid, {shutdown, Explanation}, infinity).
 
-init(Parent, HelperSup) ->
+init(Parent, HelperSup, Ref, Sock) ->
     Deb = sys:debug_options([]),
-    receive
-        {go, Sock, SockTransform} ->
-            start_connection(Parent, HelperSup, Deb, Sock, SockTransform)
-    end.
+    ok = ranch:accept_ack(Ref),
+    start_connection(Parent, HelperSup, Deb, Sock).
 
 system_continue(Parent, Deb, {Buf, BufLen, State}) ->
     mainloop(Deb, Buf, BufLen, State#v1{parent = Parent}).
@@ -320,12 +321,11 @@ socket_op(Sock, Fun) ->
     case Fun(Sock) of
         {ok, Res}       -> Res;
         {error, Reason} -> socket_error(Reason),
-                           %% NB: this is tcp socket, even in case of ssl
                            rabbit_net:fast_close(Sock),
                            exit(normal)
     end.
 
-start_connection(Parent, HelperSup, Deb, Sock, SockTransform) ->
+start_connection(Parent, HelperSup, Deb, Sock) ->
     process_flag(trap_exit, true),
     Name = case rabbit_net:connection_string(Sock, inbound) of
                {ok, Str}         -> Str;
@@ -336,13 +336,12 @@ start_connection(Parent, HelperSup, Deb, Sock, SockTransform) ->
                                     exit(normal)
            end,
     {ok, HandshakeTimeout} = application:get_env(rabbit, handshake_timeout),
-    ClientSock = socket_op(Sock, SockTransform),
     erlang:send_after(HandshakeTimeout, self(), handshake_timeout),
     {PeerHost, PeerPort, Host, Port} =
         socket_op(Sock, fun (S) -> rabbit_net:socket_ends(S, inbound) end),
     ?store_proc_name(list_to_binary(Name)),
     State = #v1{parent              = Parent,
-                sock                = ClientSock,
+                sock                = Sock,
                 connection          = #connection{
                   name               = list_to_binary(Name),
                   host               = Host,
@@ -389,7 +388,7 @@ start_connection(Parent, HelperSup, Deb, Sock, SockTransform) ->
         %% the socket. However, to keep the file_handle_cache
         %% accounting as accurate as possible we ought to close the
         %% socket w/o delay before termination.
-        rabbit_net:fast_close(ClientSock),
+        rabbit_net:fast_close(Sock),
         rabbit_networking:unregister_connection(self()),
         rabbit_event:notify(connection_closed, [{pid, self()}])
     end,
@@ -1083,6 +1082,9 @@ handle_method0(#'connection.tune_ok'{frame_max   = FrameMax,
            frame_max,   ?FRAME_MIN_SIZE, FrameMax),
     ok = validate_negotiated_integer_value(
            channel_max, ?CHANNEL_MIN,    ChannelMax),
+
+%% @todo change here!
+
     {ok, Collector} = rabbit_connection_helper_sup:start_queue_collector(
                         SupPid, Connection#connection.name),
     Frame = rabbit_binary_generator:build_heartbeat_frame(),
@@ -1113,6 +1115,9 @@ handle_method0(#'connection.open'{virtual_host = VHostPath},
     ok = send_on_channel0(Sock, #'connection.open_ok'{}, Protocol),
     Conserve = rabbit_alarm:register(self(), {?MODULE, conserve_resources, []}),
     Throttle1 = Throttle#throttle{alarmed_by = Conserve},
+
+%% @todo change here!
+
     {ok, ChannelSupSupPid} =
         rabbit_connection_helper_sup:start_channel_sup_sup(SupPid),
     State1 = control_throttle(
